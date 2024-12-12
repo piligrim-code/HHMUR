@@ -1,0 +1,4 @@
+telebot
+llama-cpp-python
+psycopg2
+pandas
