@@ -1,4 +1,4 @@
-from db import export_dataframe_from_postgresql, import_dataframe_to_postgresql, import_dataframe_to_postgresql_ready
+from api.db import export_dataframe_from_postgresql, import_dataframe_to_postgresql, import_dataframe_to_postgresql_ready
 from model import  configure_model, get_model, evaluate_bot_response, safe_generate_content, generate_prompt
 import telebot
 import os
@@ -33,8 +33,8 @@ def main():
     df = export_dataframe_from_postgresql()
     results = []
     for index, row in df.iterrows():
-        job_title = row['Название вакансии']
-        job_description = row['Описание работы']
+        job_title = row['Название_вакансии']
+        job_description = row['Описание_работы']
         job_link = row['Ссылка']
         
         prompt = generate_prompt(job_title, job_description)
@@ -52,5 +52,5 @@ def main():
     df['evaluation_score'] = results_df['evaluation_score']
     import_dataframe_to_postgresql_ready(df)
 
-    if __name__ == "__main__":
+if __name__ == "__main__":
     main()

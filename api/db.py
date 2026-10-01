@@ -1,121 +1,78 @@
-import psycorg2
+"""DataFrame persistence with explicit, environment-only configuration."""
+from contextlib import closing
+import os
+
 import pandas as pd
+import psycopg2
+from psycopg2 import sql
 
-DATABASE_URL = "postgresql://postgres:1111@localhost:5432/postgres"
-
-def import_dataframe_to_postgresql(df, table_name='vacancies'):
-    try:
-        conn = psycopg2.connect(DATABASE_URL) 
-        cur = conn.cursor()
-
-        create_table_query = """
-            CREATE TABLE IF NOT EXISTS vacancies (
-                id SERIAL PRIMARY KEY,
-                Название_вакансии TEXT,
-                Работодатель TEXT,
-                Опыт_работы TEXT,
-                Город TEXT,
-                Требования TEXT,
-                Описание_работы TEXT,
-                Ссылка TEXT
-            );
-        """
-        cur.execute(create_table_query)
+VACANCY_COLUMNS = (
+    "Название_вакансии", "Работодатель", "Опыт_работы", "Город",
+    "Требования", "Описание_работы", "Ссылка",
+)
+READY_COLUMNS = VACANCY_COLUMNS + ("Ответ", "Оценка")
+COLUMN_ALIASES = {
+    "Название вакансии": "Название_вакансии", "Опыт работы": "Опыт_работы",
+    "Описание работы": "Описание_работы", "response_text": "Ответ",
+    "evaluation_score": "Оценка",
+}
 
 
-        data_tuples = [tuple(row) for row in df.values]
-        print(data_tuples)
-
-        placeholders = ','.join(['%s'] * len(df.columns))
-    
-        insert_query = f"""
-            INSERT INTO vacancies (Название_вакансии, Работодатель, Опыт_работы, Город, Требования, Описание_работы, Ссылка)
-            VALUES ({placeholders})
-        """
-        print(insert_query)
-
-        cur.executemany(insert_query, data_tuples) 
-
-        conn.commit()  
-        print(f"DataFrame успешно импортирован в таблицу '{table_name}'.")
-
-    except psycopg2.Error as e:
-        print(f"Ошибка при импорте DataFrame: {e}")
-    finally:
-        if conn:
-            cur.close()
-            conn.close() 
-
-def export_dataframe_from_postgresql(table_name='vacancies', chunksize=1000):
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-
-        select_query = f"SELECT * FROM {table_name}"
-
-        df = pd.DataFrame()
-        cur.execute(select_query)
-        while True:
-            chunk = cur.fetchmany(chunksize)
-            if not chunk:
-                break
-            chunk_df = pd.DataFrame(chunk, columns=[desc[0] for desc in cur.description])
-            df = pd.concat([df, chunk_df], ignore_index=True)
+def _connect():
+    dsn = os.environ.get("HHMUR_DATABASE_URL", "").strip()
+    if not dsn:
+        raise ValueError("Set HHMUR_DATABASE_URL before accessing the database")
+    return psycopg2.connect(dsn, connect_timeout=5)
 
 
-        conn.commit()
-        print(f"Данные успешно экспортированы из таблицы '{table_name}'.")
-        return df
-
-    except psycopg2.Error as e:
-        print(f"Ошибка при экспорте данных: {e}")
-        return None
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
-
-def import_dataframe_to_postgresql_ready(df, table_name='vacancies_ready'):
-    try:
-        conn = psycopg2.connect(DATABASE_URL) 
-        cur = conn.cursor()
-
-        create_table_query = """
-            CREATE TABLE IF NOT EXISTS vacancies (
-                id SERIAL PRIMARY KEY,
-                Название_вакансии TEXT,
-                Работодатель TEXT,
-                Опыт_работы TEXT,
-                Город TEXT,
-                Требования TEXT,
-                Описание_работы TEXT,
-                Ссылка TEXT,
-                Ответ,
-                Оценка TEXT
-            );
-        """
-        cur.execute(create_table_query)
+def _write_dataframe(df, table_name, columns):
+    frame = df.rename(columns=COLUMN_ALIASES)
+    if frame.columns.duplicated().any():
+        raise ValueError("Duplicate DataFrame columns after normalization")
+    if not set(columns).issubset(frame.columns):
+        raise ValueError("DataFrame is missing required vacancy columns")
+    # Column order must not depend on the caller's DataFrame layout.
+    frame = frame.loc[:, list(columns)].astype(object)
+    frame = frame.where(pd.notna(frame), None)
+    rows = list(frame.itertuples(index=False, name=None))
+    table = sql.Identifier(table_name)
+    definitions = sql.SQL(", ").join(
+        sql.SQL("{} TEXT").format(sql.Identifier(name)) for name in columns
+    )
+    create = sql.SQL("CREATE TABLE IF NOT EXISTS {} (id SERIAL PRIMARY KEY, {})").format(table, definitions)
+    insert = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
+        table, sql.SQL(", ").join(map(sql.Identifier, columns)),
+        sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+    )
+    with closing(_connect()) as conn:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(create)
+                if rows:
+                    cur.executemany(insert, rows)
 
 
-        data_tuples = [tuple(row) for row in df.values]
-        print(data_tuples)
+def import_dataframe_to_postgresql(df, table_name="vacancies"):
+    _write_dataframe(df, table_name, VACANCY_COLUMNS)
 
-        placeholders = ','.join(['%s'] * len(df.columns))
-    
-        insert_query = f"""
-            INSERT INTO vacancies (Название_вакансии, Работодатель, Опыт_работы, Город, Требования, Описание_работы, Ссылка, Ответ, Оценка)
-            VALUES ({placeholders})
-        """
-        print(insert_query)
 
-        cur.executemany(insert_query, data_tuples) 
+def import_dataframe_to_postgresql_ready(df, table_name="vacancies_ready"):
+    _write_dataframe(df, table_name, READY_COLUMNS)
 
-        conn.commit()  
-        print(f"DataFrame успешно импортирован в таблицу '{table_name}'.")
 
-    except psycopg2.Error as e:
-        print(f"Ошибка при импорте DataFrame: {e}")
-    finally:
-        if conn:
-            cur.close()
-            conn.close() 
+def export_dataframe_from_postgresql(table_name="vacancies", chunksize=1000):
+    if isinstance(chunksize, bool) or not isinstance(chunksize, int) or chunksize <= 0:
+        raise ValueError("chunksize must be a positive integer")
+    query = sql.SQL("SELECT * FROM {}").format(sql.Identifier(table_name))
+    with closing(_connect()) as conn:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(query)
+                columns = [field[0] for field in cur.description]
+                rows = []
+                while True:
+                    chunk = cur.fetchmany(chunksize)
+                    if not chunk:
+                        break
+                    rows.extend(chunk)
+    return pd.DataFrame.from_records(rows, columns=columns)
