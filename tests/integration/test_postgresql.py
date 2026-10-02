@@ -12,6 +12,8 @@ from psycopg2.extensions import make_dsn
 import pytest
 
 from api import db
+from api.main import run_database_pipeline
+from api.pipeline import Evaluation, PipelineError
 
 pytestmark = pytest.mark.skipif(os.environ.get("HHMUR_INTEGRATION") != "1", reason="requires owned disposable PostgreSQL")
 
@@ -191,3 +193,73 @@ def test_overlong_identifier_does_not_alias_an_existing_table(database, short):
         assert len(db.export_dataframe_from_postgresql(short)) == 1, "Overlong identifier silently appended to an existing table"
         pytest.fail("Overlong identifiers must be rejected")
     assert len(db.export_dataframe_from_postgresql(short)) == 1
+
+
+def test_pipeline_commits_before_notifications_on_separate_connection(database):
+    source = frame(3)
+    db.import_dataframe_to_postgresql(source)
+    messages = []
+    def evaluate(title, description):
+        return Evaluation("Synthetic reply: " + title, int(title != source.iloc[1, 0]))
+    def notify(message):
+        # A new connection must see the entire committed batch.
+        saved = db.export_dataframe_from_postgresql("vacancies_ready").sort_values("id")
+        assert saved[db.READY_COLUMNS[-1]].tolist() == ["1", "0", "1"]
+        assert saved[db.READY_COLUMNS[-2]].tolist() == [
+            "Synthetic reply: " + title for title in source.iloc[:, 0]]
+        messages.append(message)
+    report = run_database_pipeline(evaluate=evaluate, notify=notify)
+    assert report.persisted == 3 and report.notifications_sent == 2
+    assert report.notification_failures == () and len(messages) == 2
+    assert len(db.export_dataframe_from_postgresql()) == 3
+
+
+def test_pipeline_evaluation_failure_leaves_no_output_table(database):
+    db.import_dataframe_to_postgresql(frame(2))
+    evaluated, messages = [], []
+    def evaluate(title, description):
+        evaluated.append(title)
+        if len(evaluated) == 2:
+            raise RuntimeError("Synthetic provider failure")
+        return Evaluation("Synthetic reply", 1)
+    with pytest.raises(PipelineError, match="evaluation"):
+        run_database_pipeline(evaluate=evaluate, notify=messages.append)
+    assert database.execute("SELECT to_regclass('vacancies_ready')", fetch=True) == [(None,)]
+    assert messages == [] and len(evaluated) == 2
+
+
+def test_pipeline_transaction_failure_rolls_back_and_suppresses_notifications(database):
+    source = frame(2)
+    db.import_dataframe_to_postgresql(source)
+    db.import_dataframe_to_postgresql_ready(pd.DataFrame(columns=db.READY_COLUMNS))
+    database.execute(sql.SQL("ALTER TABLE vacancies_ready ADD CONSTRAINT reject_pipeline CHECK ({} <> %s)").format(
+        sql.Identifier(db.VACANCY_COLUMNS[0])), (source.iloc[1, 0],))
+    messages = []
+    with pytest.raises(PipelineError, match="persistence"):
+        run_database_pipeline(evaluate=lambda title, description: Evaluation("Synthetic reply", 1),
+                              notify=messages.append)
+    assert db.export_dataframe_from_postgresql("vacancies_ready").empty
+    assert len(db.export_dataframe_from_postgresql()) == 2 and messages == []
+
+
+def test_pipeline_notification_failure_keeps_committed_results(database):
+    db.import_dataframe_to_postgresql(frame(2))
+    attempts = []
+    def notify(message):
+        attempts.append(message)
+        raise TimeoutError("Synthetic ambiguous delivery")
+    report = run_database_pipeline(evaluate=lambda title, description: Evaluation("Synthetic reply", 1),
+                                   notify=notify)
+    assert report.notification_failures == (0, 1)
+    assert report.persisted == 2 and report.notifications_sent == 0
+    assert len(attempts) == 2
+    assert len(db.export_dataframe_from_postgresql("vacancies_ready")) == 2
+
+
+def test_empty_database_pipeline_makes_no_evaluation_or_output(database):
+    db.import_dataframe_to_postgresql(frame(0))
+    def forbidden(*args):
+        pytest.fail("Empty input must not call an external adapter")
+    report = run_database_pipeline(evaluate=forbidden, notify=forbidden)
+    assert report.persisted == 0
+    assert database.execute("SELECT to_regclass('vacancies_ready')", fetch=True) == [(None,)]

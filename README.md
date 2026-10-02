@@ -26,12 +26,80 @@ python -m pip install -r requirements-test.txt
 python -m pytest tests -q
 ```
 
-The default suite uses a mocked PostgreSQL connection and compiles sources without starting
-Telegram, browser automation or model clients. They do not certify the complete
-scraping/evaluation/notification pipeline. Legacy integrations still need
-dependency/configuration review and synthetic end-to-end tests. The database
-pipeline module is `api.main`; it requires the legacy integrations and is not
-an offline demo. Existing schemas may need a separate reviewed migration.
+The default suite tests the adapter with mocked connections and the pipeline
+with synthetic evaluators, persistence and notification callbacks. Import/CLI
+checks forbid legacy provider imports and network connections. Neither these
+tests nor the demo certify real model quality, Telegram delivery or scraping.
+
+## Synthetic Pipeline Demo
+
+```sh
+python -m api.main --demo
+```
+
+This runs two invented vacancies through a deterministic rule, in-memory
+persistence and an in-memory notification sink. It prints only counters:
+two persisted, one accepted, one notification captured. It is not an LLM
+demonstration and does not connect to PostgreSQL, Telegram or vacancy sites.
+No `.env`, prompt file, model weights or historical records are read.
+Without `--demo` the CLI exits with usage; imports and `--help` start no services.
+
+`api.pipeline.run_pipeline` accepts a DataFrame and explicit `evaluate`,
+`persist` and optional `notify` callbacks. `api.main.run_database_pipeline`
+connects that core to the existing database adapter **when explicitly called**.
+The caller supplies and owns the evaluator/notifier; there are no live
+provider adapters or automatic model downloads on this path.
+
+### Processing Contract
+
+- All required columns and row fields are validated before evaluation. Title,
+  description and link must be nonempty text; other declared fields may be
+  text or missing. Aliases are normalized and duplicate columns rejected.
+  The default maximum is 1,000 rows, configurable with `max_rows`.
+- The evaluator is called once per row with `(title, description)` and returns
+  `Evaluation(response, score)`. Scores must be integer `0` or `1`, not booleans,
+  floats or missing values. Replies must be nonempty UTF-8 text without NUL,
+  at most 16,000 characters. `parse_evaluation` optionally parses exactly one
+  standalone `Score: 0/1` or Russian-equivalent line; ambiguous replies fail.
+- Evaluation failure aborts the batch before any persistence or notification.
+  Previously evaluated rows are not saved. Original DataFrame indices,
+  including duplicates, cannot shift replies to the wrong vacancy.
+- Persistence is called once with the complete batch. Custom callbacks must
+  commit atomically; the provided PostgreSQL writer uses one transaction.
+  A persistence exception suppresses all notifications.
+- Only after successful persistence are accepted rows notified, once each.
+  Notification failures do not undo committed rows or stop other notifications.
+  The returned `PipelineReport` lists failed **zero-based input positions**,
+  sent counts and explicitly skipped notifications when no notifier was given.
+  Callers must inspect that report; a return is not proof of complete delivery.
+- Notifications are plain text, capped at 3,500 UTF-16 units; replies in the
+  database are not truncated. A real notifier must disable markup parsing,
+  set its own timeouts and manage client closure. Callbacks own their resources
+  and deadlines; the core does not interrupt a hung callback.
+- Wrapped load/evaluation/persistence errors expose stage and position rather
+  than provider exception text. There is no automatic retry or payload logging.
+  These diagnostics do not scrub logs emitted independently by custom callbacks.
+
+### Recovery Limits
+
+There is no durable notification outbox, processed marker or deduplication.
+Running a database batch again appends duplicate results and may resend messages.
+A process crash after commit can leave undelivered notifications; a delivery
+timeout may mean the recipient already received the message. A lost commit
+acknowledgement is also ambiguous. Inspect durable state before any manual
+replay. This is **not** an exactly-once or production recovery guarantee.
+
+The database reader still materializes the entire source table before the row
+limit is checked; the limit bounds evaluation calls, not database read memory.
+Source order is unspecified. Report positions apply only to that particular
+batch and are not stable database identifiers.
+
+The root `main.py`, `model.py`, scraper and old `requirements.txt` are historical,
+unqualified integrations, not this supported demo path. In particular the
+legacy model module has obsolete configuration, implicit downloads and unsafe
+retry behavior; do not wire it into the new pipeline unchanged. Install
+`requirements-test.txt` for the demo. Existing schemas may need a separate
+reviewed migration. This change does not qualify the current private application.
 
 ## Disposable PostgreSQL Integration
 
@@ -57,7 +125,11 @@ strings are synthetic. No vacancy site, model API or Telegram service is used.
 The suite checks both schemas, appended/reordered rows, empty frames, aliases,
 NULLs, numeric zero, quoted values/names, multi-fetch export, full batch/DDL
 rollback, incompatible legacy schemas, read-only failures, connection closure
-and ASCII/multibyte identifier collisions. These opt-in tests are skipped by
+and ASCII/multibyte identifier collisions. Synthetic pipeline cases also check
+that separate connections see the full commit before notification, evaluation
+failure leaves no output table, failed writes roll back, notification failure
+preserves committed results, and empty input causes no adapter calls.
+These opt-in tests are skipped by
 the default command; CI runs them in a separate Linux job with actual PostgreSQL.
 
 On completion or ordinary failure, the runner removes only its own labeled

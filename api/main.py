@@ -1,56 +1,61 @@
-from api.db import export_dataframe_from_postgresql, import_dataframe_to_postgresql, import_dataframe_to_postgresql_ready
-from model import  configure_model, get_model, evaluate_bot_response, safe_generate_content, generate_prompt
-import telebot
-import os
-from dotenv import load_dotenv
+"""Explicit pipeline entry points; importing this module starts no services."""
+import argparse
+from dataclasses import asdict
+import json
+
 import pandas as pd
 
-load_dotenv()
+from api import db
+from api.pipeline import Evaluation, PipelineError, _validate_options, run_pipeline
 
-use_second_api = False
-PROCESSED_LINKS_FILE = "store.txt"
 
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-CHAT_ID = os.getenv('CHAT_ID')
+def run_database_pipeline(*, evaluate, notify=None, source="vacancies",
+                          destination="vacancies_ready", max_rows=1000):
+    """Read the configured DB only when explicitly called by an application."""
+    _validate_options(evaluate, db.import_dataframe_to_postgresql_ready, notify, max_rows)
+    db._table_identifier(source)
+    db._table_identifier(destination)
+    if source == destination:
+        raise ValueError("Source and destination must differ")
+    try:
+        vacancies = db.export_dataframe_from_postgresql(source)
+    except Exception:
+        raise PipelineError("load") from None
+    return run_pipeline(
+        vacancies, evaluate=evaluate,
+        persist=lambda frame: db.import_dataframe_to_postgresql_ready(frame, destination),
+        notify=notify, max_rows=max_rows,
+    )
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-def send_message_to_telegram(chat_id, message):
-    bot.send_message(chat_id, message)
+def demo():
+    """Synthetic, deterministic in-memory demonstration, not model inference."""
+    vacancies = pd.DataFrame([
+        ["Synthetic Python role", "Example A", "Any", "Remote", "Python",
+         "Synthetic backend task", "https://example.invalid/jobs/1"],
+        ["Synthetic other role", "Example B", "Any", "Remote", "Other",
+         "Synthetic other task", "https://example.invalid/jobs/2"],
+    ], columns=db.VACANCY_COLUMNS, index=[42, 7])
+    saved, messages = [], []
 
-def evaluate_and_notify(job_link, job_title, response_text, evaluation_score):
-    if evaluation_score == 1: 
-        message_1 = f"Оценка: {evaluation_score}\nВакансия: {job_title}\nСсылка: {job_link}"
-        message_2 = f"Письмо нейросети: {response_text}"
-        
-        # Отправляем первое сообщение с ссылкой и оценкой
-        send_message_to_telegram(CHAT_ID, message_1)
-        # Отправляем второе сообщение с описанием и ответом
-        send_message_to_telegram(CHAT_ID, message_2)
-    
+    def evaluate(title, description):
+        return Evaluation("Synthetic rule-based reply; no model was called.",
+                          int(title == "Synthetic Python role"))
 
-def main():
-    df = export_dataframe_from_postgresql()
-    results = []
-    for index, row in df.iterrows():
-        job_title = row['Название_вакансии']
-        job_description = row['Описание_работы']
-        job_link = row['Ссылка']
-        
-        prompt = generate_prompt(job_title, job_description)
-        model = get_model()  
-        response_text = safe_generate_content(model, prompt)
+    report = run_pipeline(vacancies, evaluate=evaluate,
+                          persist=lambda frame: saved.append(frame.copy()),
+                          notify=messages.append)
+    return {"mode": "synthetic-offline", **asdict(report)}
 
-        evaluation_score = evaluate_bot_response(response_text)
 
-        if evaluation_score is not None:
-            evaluate_and_notify(job_link, job_title, response_text, evaluation_score)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="HHMUR synthetic pipeline demonstration")
+    parser.add_argument("--demo", action="store_true", required=True,
+                        help="Use only synthetic rows and in-memory adapters")
+    parser.parse_args(argv)
+    print(json.dumps(demo(), sort_keys=True))
+    return 0
 
-        results.append({'response_text': response_text, 'evaluation_score': evaluation_score or 0})
-    results_df = pd.DataFrame(results)
-    df['response_text'] = results_df['response_text']
-    df['evaluation_score'] = results_df['evaluation_score']
-    import_dataframe_to_postgresql_ready(df)
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
