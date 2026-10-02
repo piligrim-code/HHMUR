@@ -110,3 +110,39 @@ def test_db_has_no_connection_string_literal():
     tree = ast.parse(Path(db.__file__).read_text(encoding="utf-8"))
     values = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
     assert not any("postgres://" in v or "postgresql://" in v for v in values)
+
+
+def invoke(operation, table):
+    if operation == "read":
+        return db.export_dataframe_from_postgresql(table)
+    writer = db.import_dataframe_to_postgresql_ready if operation == "ready" else db.import_dataframe_to_postgresql
+    return writer(frame(ready=operation == "ready"), table)
+
+
+@pytest.mark.parametrize("operation", ["write", "ready", "read"])
+@pytest.mark.parametrize("table", [None, 12, "", "bad\x00name", "x" * 64, "\u044f" * 32, "\ud800"])
+def test_invalid_identifier_never_connects(operation, table):
+    with patch.object(db, "_connect") as connect:
+        with pytest.raises(ValueError, match="table_name"):
+            invoke(operation, table)
+        connect.assert_not_called()
+
+
+@pytest.mark.parametrize("operation", ["write", "ready", "read"])
+@pytest.mark.parametrize("table", ["x" * 63, "\u044f" * 31 + "x"])
+def test_identifier_limit_counts_utf8_bytes_and_allows_exact_boundary(connection, operation, table):
+    _, cursor, connect = connection
+    cursor.description = [("id",)]
+    cursor.fetchmany.return_value = []
+    invoke(operation, table)
+    connect.assert_called_once()
+
+
+def test_alias_collision_is_rejected_before_connecting():
+    source = frame()
+    alias, normalized = next(iter(db.COLUMN_ALIASES.items()))
+    source[alias] = source[normalized]
+    with patch.object(db, "_connect") as connect:
+        with pytest.raises(ValueError, match="Duplicate"):
+            db.import_dataframe_to_postgresql(source)
+        connect.assert_not_called()

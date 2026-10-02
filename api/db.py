@@ -25,7 +25,22 @@ def _connect():
     return psycopg2.connect(dsn, connect_timeout=5)
 
 
+def _table_identifier(table_name):
+    message = "table_name must be nonempty UTF-8 text without NUL and at most 63 bytes"
+    if not isinstance(table_name, str) or not table_name or "\x00" in table_name:
+        raise ValueError(message)
+    try:
+        encoded = table_name.encode("utf-8")
+    except UnicodeError:
+        raise ValueError(message) from None
+    # PostgreSQL truncation can turn an intended new name into an existing table.
+    if len(encoded) > 63:
+        raise ValueError(message)
+    return sql.Identifier(table_name)
+
+
 def _write_dataframe(df, table_name, columns):
+    table = _table_identifier(table_name)
     frame = df.rename(columns=COLUMN_ALIASES)
     if frame.columns.duplicated().any():
         raise ValueError("Duplicate DataFrame columns after normalization")
@@ -35,7 +50,6 @@ def _write_dataframe(df, table_name, columns):
     frame = frame.loc[:, list(columns)].astype(object)
     frame = frame.where(pd.notna(frame), None)
     rows = list(frame.itertuples(index=False, name=None))
-    table = sql.Identifier(table_name)
     definitions = sql.SQL(", ").join(
         sql.SQL("{} TEXT").format(sql.Identifier(name)) for name in columns
     )
@@ -63,7 +77,7 @@ def import_dataframe_to_postgresql_ready(df, table_name="vacancies_ready"):
 def export_dataframe_from_postgresql(table_name="vacancies", chunksize=1000):
     if isinstance(chunksize, bool) or not isinstance(chunksize, int) or chunksize <= 0:
         raise ValueError("chunksize must be a positive integer")
-    query = sql.SQL("SELECT * FROM {}").format(sql.Identifier(table_name))
+    query = sql.SQL("SELECT * FROM {}").format(_table_identifier(table_name))
     with closing(_connect()) as conn:
         with conn:
             with conn.cursor() as cur:
