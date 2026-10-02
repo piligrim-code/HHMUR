@@ -80,7 +80,7 @@ provider adapters or automatic model downloads on this path.
   than provider exception text. There is no automatic retry or payload logging.
   These diagnostics do not scrub logs emitted independently by custom callbacks.
 
-### Recovery Limits
+### Recovery Limits Of The Simple Pipeline
 
 There is no durable notification outbox, processed marker or deduplication.
 Running a database batch again appends duplicate results and may resend messages.
@@ -93,6 +93,29 @@ The database reader still materializes the entire source table before the row
 limit is checked; the limit bounds evaluation calls, not database read memory.
 Source order is unspecified. Report positions apply only to that particular
 batch and are not stable database identifiers.
+
+## Opt-In Durable Results And Notifications
+
+`api.durable` adds a separate PostgreSQL-backed path with persistent result
+deduplication and an outbox. It does not silently change `run_pipeline`,
+`run_database_pipeline`, the offline CLI or legacy tables.
+
+- Call `initialize_store()` explicitly once in a reviewed schema.
+- Pass validated vacancy batches to `process_durable_batch`, with an explicit
+  scope identifying the evaluation policy/version and notification audience.
+- Results and accepted-row notifications commit in one transaction. Repeated
+  input in the same scope skips already committed evaluations.
+- Call `dispatch_outbox` separately with an explicit notification callback.
+  Concurrent dispatchers claim different pending events. Failures or interrupted
+  attempts never become automatic retries.
+- Inspect uncertain deliveries and resolve them explicitly. Requeueing requires
+  acknowledgement of duplicate-delivery risk; an external recipient may already
+  have received the message.
+
+See `docs/durable-pipeline.md` for the API contract, recovery procedure and
+remaining limits. This path still needs separately reviewed live-provider
+adapters, access controls and deployment qualification. The default CLI remains
+offline; durable-state tests run against owned disposable PostgreSQL in CI.
 
 The root `main.py`, `model.py`, scraper and old `requirements.txt` are historical,
 unqualified integrations, not this supported demo path. In particular the
@@ -129,6 +152,9 @@ and ASCII/multibyte identifier collisions. Synthetic pipeline cases also check
 that separate connections see the full commit before notification, evaluation
 failure leaves no output table, failed writes roll back, notification failure
 preserves committed results, and empty input causes no adapter calls.
+Durable-store tests additionally exercise deduplication, atomic result/outbox
+rollback, concurrent writers/dispatchers, interrupted and uncertain deliveries,
+explicit recovery and stale claim/operator rejection.
 These opt-in tests are skipped by
 the default command; CI runs them in a separate Linux job with actual PostgreSQL.
 
