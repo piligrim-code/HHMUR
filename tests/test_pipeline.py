@@ -293,6 +293,7 @@ socket.create_connection = forbidden
 import psycopg2
 psycopg2.connect = forbidden
 from api.main import main
+import api.durable
 raise SystemExit(main(sys.argv[1:]))
 """
     result = subprocess.run([sys.executable, "-c", script, *args],
