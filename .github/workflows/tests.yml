@@ -1,4 +1,4 @@
-name: Database adapter regressions
+name: Database and pipeline regressions
 on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
@@ -15,6 +15,7 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r requirements-test.txt
       - run: python -m pytest tests -q
+      - run: python -m api.main --demo
       - run: python -m pip check
   integration:
     runs-on: ubuntu-latest
