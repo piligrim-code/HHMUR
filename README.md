@@ -113,9 +113,27 @@ deduplication and an outbox. It does not silently change `run_pipeline`,
   have received the message.
 
 See `docs/durable-pipeline.md` for the API contract, recovery procedure and
-remaining limits. This path still needs separately reviewed live-provider
-adapters, access controls and deployment qualification. The default CLI remains
+remaining limits. This path still needs live-provider validation, access
+controls and deployment qualification. The default CLI remains
 offline; durable-state tests run against owned disposable PostgreSQL in CI.
+
+## Explicit Provider Adapters
+
+`api.providers.GeminiEvaluator` and `TelegramNotifier` implement synchronous
+HTTP adapters for the durable path. They require explicit configuration and
+`allow_network=True` for actual network access. There is no default model,
+implicit `.env` loading, service startup or automatic retry.
+
+The evaluator requests structured JSON and rejects incomplete, blocked or
+invalid scores. Telegram delivery requires a successful receipt for the
+configured numeric chat; messages use plain text with link previews and paid
+broadcasting disabled. Clients have timeouts, bounded response bodies and
+context-managed cleanup. See `docs/providers.md` for the exact contract.
+
+Provider tests use `httpx.MockTransport`. Additional PostgreSQL tests exercise
+these adapters through the durable path, still with synthetic HTTP responses.
+No real model quality, current account/model access, Telegram permissions or
+actual external delivery is certified by those tests.
 
 The root `main.py`, `model.py`, scraper and old `requirements.txt` are historical,
 unqualified integrations, not this supported demo path. In particular the

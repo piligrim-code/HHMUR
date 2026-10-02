@@ -1,3 +1,4 @@
 pandas>=2.2,<4
 psycopg2-binary>=2.9,<3
 pytest>=8,<10
+-r requirements-providers.txt
