@@ -38,6 +38,8 @@ normally from `notify` means delivery success to this library. A callback that
 only schedules background work must not claim successful delivery this way.
 Async callbacks are rejected before claiming work; a wrapper returning an
 awaitable is an error, not successful delivery. Use a synchronous adapter.
+The explicit Gemini and Telegram HTTP implementations are documented in
+`docs/providers.md`; they have only synthetic provider-response qualification.
 
 Initialization creates `hhmur_results_v1` and `hhmur_outbox_v1` plus a partial
 pending-event index. It is repeatable for the unchanged v1 schema, not a general

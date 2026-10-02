@@ -1,14 +1,17 @@
 """Durable state, rollback and concurrency checks against owned PostgreSQL."""
 from concurrent.futures import ThreadPoolExecutor
+import json
 import os
 from threading import Barrier
 from unittest.mock import Mock
 
 import pandas as pd
+import httpx
 import pytest
 
 from api import db, durable
 from api.pipeline import Evaluation, PipelineError
+from api.providers import GeminiEvaluator, TelegramNotifier
 
 pytestmark = pytest.mark.skipif(os.environ.get("HHMUR_INTEGRATION") != "1",
                                reason="requires owned disposable PostgreSQL")
@@ -258,3 +261,61 @@ def test_scope_values_are_bound_and_metadata_listing_is_bounded(store):
     assert len(durable.list_notifications(scope=hostile_scope, state="pending", limit=1)) == 1
     assert durable.dispatch_outbox(scope=SCOPE, notify=Mock()).sent == 0
     assert durable.dispatch_outbox(scope=hostile_scope, notify=Mock()).sent == 2
+
+
+def test_provider_adapters_complete_durable_path_without_external_network(store):
+    model_calls, telegram_calls = [], []
+    def generate(request):
+        data = json.loads(json.loads(request.content)["contents"][0]["parts"][0]["text"])
+        model_calls.append(data["title"])
+        answer = {"score": int(data["title"] == "role-0"), "response": "Synthetic assessment"}
+        return httpx.Response(200, json={"candidates": [{"finishReason": "STOP",
+            "content": {"parts": [{"text": json.dumps(answer)}]}}]})
+    def send(request):
+        telegram_calls.append(request)
+        assert counts(store) == (2, 1)
+        assert len(durable.list_notifications(scope=SCOPE, state="inflight")) == 1
+        assert json.loads(request.content)["chat_id"] == -123
+        return httpx.Response(200, json={"ok": True, "result": {
+            "message_id": 1, "chat": {"id": -123}}})
+    with GeminiEvaluator(api_key="synthetic-gemini-key", model="synthetic-model",
+                         policy="Synthetic policy", transport=httpx.MockTransport(generate)) as model:
+        with TelegramNotifier(token="123:synthetic-token", chat_id=-123,
+                              transport=httpx.MockTransport(send)) as notify:
+            assert enqueue(evaluate=model) == durable.DurableReport(2, 0, 0, 0, 2, 1)
+            assert durable.dispatch_outbox(scope=SCOPE, notify=notify).sent == 1
+            assert enqueue(evaluate=model).already_committed == 2
+            assert durable.dispatch_outbox(scope=SCOPE, notify=notify).sent == 0
+    assert len(model_calls) == 2 and len(telegram_calls) == 1
+    assert counts(store) == (2, 1)
+
+
+@pytest.mark.parametrize("failure", ["rate-limit", "timeout", "wrong-recipient"])
+def test_telegram_adapter_failure_remains_uncertain_without_replay(store, failure):
+    enqueue(frame(1))
+    calls = []
+    def send(request):
+        calls.append(request)
+        if failure == "rate-limit":
+            return httpx.Response(429, json={"ok": False, "parameters": {"retry_after": 1}})
+        if failure == "timeout":
+            raise httpx.ReadTimeout("Synthetic ambiguous transport failure")
+        return httpx.Response(200, json={"ok": True, "result": {
+            "message_id": 1, "chat": {"id": 456}}})
+    with TelegramNotifier(token="123:synthetic-token", chat_id=-123,
+                          transport=httpx.MockTransport(send)) as notify:
+        assert durable.dispatch_outbox(scope=SCOPE, notify=notify) == durable.DispatchReport(0, 1)
+        assert durable.dispatch_outbox(scope=SCOPE, notify=notify) == durable.DispatchReport(0, 0)
+    assert len(calls) == 1 and counts(store) == (1, 1)
+    assert durable.list_notifications(scope=SCOPE)[0]["reason"] == "notification_error"
+
+
+def test_invalid_provider_evaluation_commits_nothing(store):
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={
+        "candidates": [{"finishReason": "STOP", "content": {
+            "parts": [{"text": '{"score":10,"response":"Synthetic invalid score"}'}]}}]}))
+    with GeminiEvaluator(api_key="synthetic-gemini-key", model="synthetic-model",
+                         policy="Synthetic policy", transport=transport) as model:
+        with pytest.raises(PipelineError, match="evaluation"):
+            enqueue(evaluate=model)
+    assert counts(store) == (0, 0)
